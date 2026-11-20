@@ -1,47 +1,13 @@
 #imports
-import os
-import math
-import rasterio as rio
 import numpy as np
-import pandas as pd
-import pickle 
-import geopandas as gpd
-import seaborn as sns
-import contextily as cx
-import rioxarray as rxr
-import xarray as cr
-import earthpy as et
-import earthpy.spatial as es
-import earthpy.plot as ep
-import pyproj
-import richdem as rd
-import elevation
-import gdal
-import matplotlib.pyplot as plt
-
-from matplotlib_scalebar.scalebar import ScaleBar
-from rasterio.enums import Resampling
-from rasterio.plot import show as rioshow
-from rasterio.crs import CRS
-from shapely.geometry import mapping
-from pyproj import Transformer
-from fiona.crs import from_epsg
-from scipy import sparse
-from sklearn.preprocessing import MinMaxScaler
-from sklearn import preprocessing
 from sklearn import mixture
-from sklearn.neighbors import NearestNeighbors
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF
-from sklearn.metrics import mean_squared_error
-from sklearn.gaussian_process.kernels import Matern
-from sklearn.gaussian_process.kernels import WhiteKernel
-from sklearn.neighbors import BallTree
-from sklearn.metrics import mean_absolute_error
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import r2_score as r2
+from sklearn.metrics import root_mean_squared_error
 from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import mean_absolute_error
+from sklearn.neighbors import BallTree
+from sklearn.preprocessing import MinMaxScaler
+
 
 #Define functions
 def neighbors(num_neighbors,dat,gmm):
@@ -65,7 +31,7 @@ def neighbors(num_neighbors,dat,gmm):
     
     # Find the closest locations using a Ball Tree structure for efficient nearest-neighbor search.
     tree = BallTree(dat)
-    distance, inx_initial = tree.query(gmm.means_, k=num_neighbors)
+    _distance, inx_initial = tree.query(gmm.means_, k=num_neighbors)
     
     # Retrieve the indices of the nearest neighbors.
     dat_indices = np.array(dat.index.to_list())
@@ -106,18 +72,16 @@ def modified_sample_loc(num_neighbors,d,dat,gmm):
     
     # Loop through each cluster center's neighbors and store their "No_go" status.
     for i in range(len(snow_neighbors)):
-        val = 0
-        for j in snow_neighbors[i]:
+        for val, j in enumerate(snow_neighbors[i]):
             nbr_dict[j] = (d['No_go'].loc[j])
             nbr_inx[i,val] = {j: nbr_dict[j]}
-            val +=1
     print(nbr_inx)
 
     # Find the nearest neighbor within the "go" region for each cluster center.
     final_inx = []
     for i in range(len(nbr_inx)):
         j = 0
-        while list(nbr_inx[i,j].values())[0] != 1:
+        while next(iter(nbr_inx[i,j].values())) != 1:
             j+=1
             if j >= num_neighbors:
                 print('Warning: GMM location #',(i+1),'had no suitable neighbors. Skipping this location.')
@@ -127,8 +91,8 @@ def modified_sample_loc(num_neighbors,d,dat,gmm):
         else:
             print(nbr_inx[i,j])
             print('neighbor# = ',j)
-            final_inx.append(list(nbr_inx[i,j].keys())[0])
-    return True, final_inx, snow_neighbors[:,0]
+            final_inx.append(next(iter(nbr_inx[i,j].keys())))
+    return len(final_inx) == len(snow_neighbors), final_inx, snow_neighbors[:,0]
 
 
 def gmm_step(d, ss, n, f, num_neighbors):
@@ -169,25 +133,21 @@ def gmm_step(d, ss, n, f, num_neighbors):
     gmm.fit(dat)
     print('point numbers:', n)
     print('gmm.means_')
-    display(gmm.means_)
+    print(gmm.means_)
     
     # Check if the GMM converged.
     if gmm.converged_ == False:
         print('Error: GMM did not converge')
     
-    # Attempt to find suitable sample locations using the modified_sample_loc function.
-    loc = np.array(d.index)
-    loc_iter = n
-    success = False
-    while not success:
-      success,inx,orig = modified_sample_loc(num_neighbors,d,dat,gmm)
+    # Select valid sensor locations.
+    success, inx, _orig = modified_sample_loc(num_neighbors, d, dat, gmm)
 
-      if success:
-        return d.loc[inx].copy()#, d.loc[orig].copy()
-      else:
-        print('Unable to find locations')
+    if not success:
+        raise ValueError(
+            f"Only {len(inx)} of {n} GMM clusters have valid sensor locations."
+        )
 
-    return d.loc[inx].copy()#, d.loc[orig].copy()
+    return d.loc[inx].copy()
 
 
 def GP_step(x, y, f, step_list, delta_list, rmse_list, score_list, bias_list, measured=False):
@@ -216,12 +176,11 @@ def GP_step(x, y, f, step_list, delta_list, rmse_list, score_list, bias_list, me
     x_train = y_nonans[f]
     y_train = y_nonans.true_snow_depth.values.reshape(-1,1)
     if measured == True:
-        x_test = x.drop((x.iloc[y.index].index.values))
+        x_test = x.drop(x.iloc[y.index].index.values)
     else:
         x_test=x.copy()
 
     #set kernel and length scales
-    lengthscales=[0.1]*len(f)
     
     #Run gpr with gridsearch to determine optimal parameters
     gpr_cv = GaussianProcessRegressor( random_state=42) 
@@ -232,7 +191,6 @@ def GP_step(x, y, f, step_list, delta_list, rmse_list, score_list, bias_list, me
 
     gp_gs = GridSearchCV(estimator=gpr_cv, param_grid=param_grid, scoring='neg_mean_absolute_error')
     gp_gs.fit(x_train, y_train)
-    print('Run number:', i,',',j)
     print(gp_gs.best_params_)
     print(gp_gs.best_score_)
     score = gp_gs.best_score_
@@ -257,14 +215,14 @@ def GP_step(x, y, f, step_list, delta_list, rmse_list, score_list, bias_list, me
     # Calculate and print performance metrics (average delta, RMSE, bias).
     avg_delta = out['depth_delta'].mean() #mean bias error
     print('avearge_delta:', avg_delta)
-    rmse = mean_squared_error(out['snow_depth_est'],out['true_snow_depth'],squared=False)
+    rmse = root_mean_squared_error(out['snow_depth_est'],out['true_snow_depth'])
     print('rmse:', rmse)
 #     bias = sum(out['depth_delta'])
     bias =out['depth_delta'].mean() #MBE
     print('bias:', bias)
     
     # Append metrics to respective lists for tracking across iterations.
-    step_list.append((len(y_train)))
+    step_list.append(len(y_train))
     delta_list.append(avg_delta)
     rmse_list.append(rmse)
     score_list.append(score)
